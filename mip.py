@@ -33,6 +33,8 @@ import logging
 import threading
 import os
 import sys
+import binascii
+import hashlib
 
 from ntplib import _to_int as timestamp_to_int
 from ntplib import _to_frac as timestamp_to_frac
@@ -410,8 +412,11 @@ class Extension:
         length  -- lenght of data (number of bytes) in the extension
         data    -- data in the extension (optional)
         """
+        if data is not None:
+            logging.debug("Length of data is %d. must be %d",len(data), length)
 
         if data is not None and len(data) != length:
+            
             logging.error("Length of data is invalid.")
             raise Error("Length of data is invalid.")
         self.type = type
@@ -481,7 +486,7 @@ class Packet:
 
     def to_data(self):
         """Return byte array representation of the packet."""
-
+        
         logging.error("Unable to get data.")
         raise Error("Unable to get data.")
 
@@ -490,13 +495,16 @@ class Packet:
         """Create and return MobileHomeAuthExtension of this packet."""
 
         packed = self.to_data()
+
         extension = MobileHomeAuthExtension(spi)
         try:
             packed += struct.pack("!2BI", extension.type, extension.length, spi)
         except struct.error:
             logging.error("Invalid MIP Mobile-Home Auth Extension fields.")
             raise Error("Invalid MIP Mobile-Home Auth Extension fields.")
-        extension.authenticator = hmac.new(key, packed).digest()
+
+        extension.authenticator = hmac.new(key, packed , hashlib.md5).digest()
+
         return extension
 
 
@@ -646,7 +654,8 @@ class RegRequestPacket(Packet):
             home_address,
             home_agent,
             care_of_address,
-            identification = None, # timestamp
+            identification = None, # part 1 timestamp row
+            identification2 = None,# part 2 timestamp row
             extensions = None
         ):
         """MIP Registration Request constructor.
@@ -657,7 +666,8 @@ class RegRequestPacket(Packet):
         home_address    -- Home IP address (dot notation)
         home_agent      -- Home Agent IP address (dot notation)
         care_of_address -- Care-of IP address (dot notation)
-        identification  -- Identification value
+        identification  -- Identification value part 1
+        identification2 -- Identification value part 2
         extensions      -- list of Extension instances
         """
         Packet.__init__(self, Packet.TYPE_REG_REQUEST, extensions)
@@ -666,14 +676,20 @@ class RegRequestPacket(Packet):
         self.home_address = home_address
         self.home_agent = home_agent
         self.care_of_address = care_of_address
-        self.identification = (system_to_ntp_time(time.time())
-                               if identification is None else identification)
+        if identification is None:
+            ts = system_to_ntp_time(time.time())
+            self.identification = timestamp_to_int(ts)
+            self.identification2 = timestamp_to_frac(ts)
+        else:
+            self.identification = identification
+            self.identification2 = identification2
+                    
         self.expiration_date = 0 # timestamp when binding will expire
 
     def __str__(self):
         return ("<MobileIP Reg Request, Flags: %d (%s), Lifetime: %d, " +
         "Home address: %s, Home agent: %s, Care-of address: %s, " +
-        "Identification: %f, Extensions: %s>") % (
+        "Identification: %d.%d, Extensions: %s>") % (
             self.flags,
             self._print_flags_desc(),
             self.lifetime,
@@ -681,6 +697,7 @@ class RegRequestPacket(Packet):
             self.home_agent,
             self.care_of_address,
             self.identification,
+            self.identification2,
             self.extensions
         )
 
@@ -699,6 +716,7 @@ class RegRequestPacket(Packet):
     @staticmethod
     def from_data(data):
         """Create and return RegRequestPacket based on given byte data."""
+        logging.debug("from_data: %s", binascii.hexlify(data))
 
         try:
             unpacked = struct.unpack(
@@ -710,14 +728,15 @@ class RegRequestPacket(Packet):
 
         extensions = Packet._extensions_from_data(
             data[struct.calcsize(RegRequestPacket._FORMAT):len(data)])
-
+    
         return RegRequestPacket(
                 unpacked[1],
                 unpacked[2],
                 int_to_ip(unpacked[3]),
                 int_to_ip(unpacked[4]),
                 int_to_ip(unpacked[5]),
-                timestamp_to_time(unpacked[6], unpacked[7]),
+                unpacked[6],
+                unpacked[7],
                 extensions
         )
 
@@ -732,9 +751,11 @@ class RegRequestPacket(Packet):
                 ip_to_int(self.home_address),
                 ip_to_int(self.home_agent),
                 ip_to_int(self.care_of_address),
-                timestamp_to_int(self.identification),
-                timestamp_to_frac(self.identification)
+                self.identification,
+                self.identification2
             )
+            logging.debug("Registration Request to_data: %s", binascii.hexlify(packed) )
+
         except struct.error:
             logging.error("Invalid Registration Request packet fields.")
             raise Error("Invalid Registration Request packet fields.")
@@ -791,6 +812,7 @@ class RegReplyPacket(Packet):
             home_address,
             home_agent,
             identification,
+            identification2,
             extensions = None,
         ):
         """MIP Registration Reply constructor.
@@ -800,7 +822,8 @@ class RegReplyPacket(Packet):
         lifetime        -- Lifetime value
         home_address    -- Home IP address (dot notation)
         home_agent      -- Home Agent IP address (dot notation)
-        identification  -- Identification value
+        identification  -- Identification value part 1
+        identification2 -- Identification value part 2
         extensions      -- list of Extension instances
         """
 
@@ -810,11 +833,13 @@ class RegReplyPacket(Packet):
         self.home_address = home_address
         self.home_agent = home_agent
         self.identification = identification
+        self.identification2 = identification2
+        
         self.expiration_date = 0 # timestamp when binding will expire
 
     def __str__(self):
         return ("<MobileIP Reg Reply, Code: %d (%s), Lifetime: %d, " +
-        "Home address: %s, Home agent: %s, Identification: %f, " +
+        "Home address: %s, Home agent: %s, Identification: %d,%d, " +
         "Extensions: %s>") % (
             self.code,
             RegReplyPacket._CODE_DESC_TABLE[self.code],
@@ -822,6 +847,7 @@ class RegReplyPacket(Packet):
             self.home_address,
             self.home_agent,
             self.identification,
+            self.identification2,
             self.extensions
         )
 
@@ -845,7 +871,8 @@ class RegReplyPacket(Packet):
                 unpacked[2],
                 int_to_ip(unpacked[3]),
                 int_to_ip(unpacked[4]),
-                timestamp_to_time(unpacked[5], unpacked[6]),
+                unpacked[5],
+                unpacked[6],
                 extensions
         )
 
@@ -859,8 +886,8 @@ class RegReplyPacket(Packet):
                 self.lifetime,
                 ip_to_int(self.home_address),
                 ip_to_int(self.home_agent),
-                timestamp_to_int(self.identification),
-                timestamp_to_frac(self.identification)
+                self.identification,
+                self.identification2
             )
         except struct.error:
             logging.error("Invalid MIP Registration Reply packet fields.")
@@ -979,6 +1006,7 @@ class MobileNodeAgent:
         # D flag (Decapsulation by mobile node) is mandatory.
         # Only GRE tunnel is supported, so G flag is mandatory and M is not allowed.
         # Reverse Tunneling is mandatory, so T flag is mandatory
+
         if not flags & RegRequestPacket.FLAG_D:
             raise Error("D flag is not set but is mandatory.")
         if not flags & RegRequestPacket.FLAG_G:
@@ -1661,6 +1689,7 @@ class HomeAgent:
         # not supported.
         # Only GRE tunnel is supported, so G is mandatory and M is not allowed.
         is_ok = True
+
         if not flags & RegRequestPacket.FLAG_D:
             logging.warning("D flag is not set but is mandatory.")
             is_ok = False
@@ -1707,6 +1736,7 @@ class HomeAgent:
                             "Discarding request.")
             return
         key = self.auth_table[mhae.spi]
+        logging.debug("Key %s, mhae.spi %s", str(key), str(mhae.spi))
         if not in_packet.verify_mhae(mhae.spi, key):
             # Authorization failed
             logging.warning("Reqest authorization is failed.")
@@ -1716,7 +1746,9 @@ class HomeAgent:
                 0x0000,
                 in_packet.home_address,
                 in_packet.home_agent,
-                in_packet.identification)
+                in_packet.identification,
+                in_packet.identification2
+                )
             out_packet.add_mhae(mhae.spi, key)
             self._send_packet(out_packet, addr)
             return
@@ -1741,7 +1773,9 @@ class HomeAgent:
                 0x0000,
                 in_packet.home_address,
                 in_packet.home_agent,
-                in_packet.identification)
+                in_packet.identification,
+                in_packet.identification2
+                )
             out_packet.add_mhae(mhae.spi, key)
             self._send_packet(out_packet, addr)
             return
@@ -1753,7 +1787,8 @@ class HomeAgent:
                 0x0000,
                 in_packet.home_address,
                 in_packet.home_agent,
-                in_packet.identification)
+                in_packet.identification,
+                in_packet.identification2)
             out_packet.add_mhae(mhae.spi, key)
             self._send_packet(out_packet, addr)
             return
@@ -1790,7 +1825,8 @@ class HomeAgent:
             in_packet.lifetime,
             in_packet.home_address,
             in_packet.home_agent,
-            in_packet.identification)
+            in_packet.identification,
+            in_packet.identification2)
         out_packet.add_mhae(mhae.spi, key)
         self._send_packet(out_packet, addr)
 
