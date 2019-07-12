@@ -1,6 +1,9 @@
+#python3
+
 # The MIT License (MIT)
 #
 # Copyright (C) 2016 Michal Kosciesza <michal@mkiol.net>
+# Modified      2019 Vladimir Guzenko  <niore82 A gmail dot com>
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -47,8 +50,9 @@ from netaddr import IPAddress, IPNetwork
 INFINITE_LIFETIME = 65535
 
 _ipr = IPRoute()
+_mip_idx = 0
 
-if not hasattr(socket,'SO_BINDTODEVICE') :
+if not hasattr(socket, 'SO_BINDTODEVICE'):
     socket.SO_BINDTODEVICE = 25
 
 
@@ -146,7 +150,7 @@ def is_address_reachable(address):
             ifprefixlen = ipo["prefixlen"]
             #logging.debug("address: %s, network: %s/%s", address, ifaddress, ifprefixlen)
             if (ifprefixlen > 0 and
-                is_address_in_subnet(address, "%s/%s"%(ifaddress, ifprefixlen))):
+                    is_address_in_subnet(address, "%s/%s" % (ifaddress, ifprefixlen))):
                 return True
     return False
 
@@ -210,18 +214,24 @@ def _del_all_default_routes():
     for ip, ifname, met in gw_list:
         if ip is None:
             if met is None:
-                logging.debug("Deleting default route via %s interface.", ifname)
+                logging.debug(
+                    "Deleting default route via %s interface.", ifname)
                 os.system("ip route del default dev %s" % ifname)
             else:
-                logging.debug("Deleting default route via %s interface with metric %d.", ifname, met)
-                os.system("ip route del default dev %s metric %d" % (ifname, met))
+                logging.debug(
+                    "Deleting default route via %s interface with metric %d.", ifname, met)
+                os.system("ip route del default dev %s metric %d" %
+                          (ifname, met))
         else:
             if met is None:
-                logging.debug("Deleting default route to %s via %s interface.", ip, ifname)
+                logging.debug(
+                    "Deleting default route to %s via %s interface.", ip, ifname)
                 os.system("ip route del default via %s dev %s" % (ip, ifname))
             else:
-                logging.debug("Deleting default route to %s via %s interface with metric %d.", ip, ifname, met)
-                os.system("ip route del default via %s dev %s metric %d" % (ip, ifname, met))
+                logging.debug(
+                    "Deleting default route to %s via %s interface with metric %d.", ip, ifname, met)
+                os.system("ip route del default via %s dev %s metric %d" %
+                          (ip, ifname, met))
 
 
 def _del_route(dst, gw=None):
@@ -241,6 +251,8 @@ def _del_route(dst, gw=None):
 def _create_tunnel(name, ip, gre_local, gre_remote, route_dst=None):
     """Create GRE tunnel interface with given name and IP address."""
 
+    logging.debug("ip %s address to %s interface. GRE remote %s GRE local %s",
+                  ip, name, gre_remote, gre_local)
     logging.debug("Creating %s interface.", name)
     _ipr.link("add", ifname=name, kind="gre",
               gre_local=gre_local,
@@ -256,6 +268,59 @@ def _create_tunnel(name, ip, gre_local, gre_remote, route_dst=None):
     if route_dst is not None:
         # Adding new route
         _add_route(route_dst, name)
+
+
+def _ipip_tunnel_exist(local_ip, remote_ip, name):
+        """Chek is ipip exist,  return [] if not or iface [idx]"""
+        tmp = _ipr.link_lookup(ifname=name)
+        if not tmp == []:
+                return tmp
+        tmp = _ipr.get_links()
+        for link in tmp:
+                if "mip" in link.get_attr('IFLA_IFNAME'):
+                        link_attr = link.get_attr('IFLA_LINKINFO').get_attr('IFLA_INFO_DATA')
+                        if local_ip in link_attr.get_attr('IFLA_IPIP_LOCAL') and remote_ip in link_attr.get_attr('IFLA_IPIP_REMOTE'):
+                                return [link['index'],link.get_attr('IFLA_IFNAME')]
+
+        return []
+
+def _create_ipip_tunnel(local_ip, remote_ip, name = "mip", unit_ip = "172.16.1.1"):
+        """Create IPIP tunnel"""
+
+        global _mip_idx
+        name = "%s%d" % (name, _mip_idx)
+        ret = 1
+        tmp = []
+        logging.debug("Creating %s tunnel interface.", name)
+        
+        if not _mip_idx == 0:
+                tmp = _ipip_tunnel_exist(local_ip,remote_ip, name )
+        
+        if tmp == []:
+                tmp = _ipr.get_addr(local=local_ip)[0]  # to get dev name
+                if_dev = tmp.get_attr("IFA_LABEL")
+                ret = os.system("ip tunnel add %s mode ipip remote %s local %s dev %s" %
+                                (name, remote_ip, local_ip, if_dev)
+                                )
+                ret = os.system("ifconfig %s %s netmask 255.255.255.0 pointopoint %s" %
+                        (name, local_ip, unit_ip)
+                )
+                ret = os.system("ifconfig %s mtu 1492 up" % name)
+                ret = os.system("route add -host %s dev %s" % 
+                        (unit_ip, name)
+                )
+                _mip_idx += 1
+        else:
+                ret = os.system("route add -host %s dev %s" % 
+                        (unit_ip, tmp[1])
+                )
+                logging.debug("tunnel interface alredy exist.")
+                return tmp
+
+        if not ret == 0:
+                raise(SystemError("Cannot create ipip tunnel with name %s" % name ))
+
+
 
 
 def _create_interface(name, ip, route_dst=None):
@@ -292,13 +357,13 @@ def _destroy_interface(name):
         # Deleting routes
         route_list = _ipr.get_routes(family=socket.AF_INET, gateway=ip)
         for route in route_list:
-            rip = route.get_attr("RTA_DST") # route["dst_len"] <- mask
+            rip = route.get_attr("RTA_DST")  # route["dst_len"] <- mask
             if rip is not None:
                 _del_route("%s/%d" % (rip, route["dst_len"]), ip)
         route_list = _ipr.get_routes(family=socket.AF_INET, scope=253)
         for route in route_list:
             if route.get_attr("RTA_OIF") == index:
-                rip = route.get_attr("RTA_DST") # route["dst_len"] <- mask
+                rip = route.get_attr("RTA_DST")  # route["dst_len"] <- mask
                 if rip is not None:
                     _del_route("%s/%d" % (rip, route["dst_len"]), name)
 
@@ -331,7 +396,8 @@ def set_ip_forward(value):
 
     with open("/proc/sys/net/ipv4/ip_forward", "w") as f:
         f.write("1\n" if value else "0\n")
-    logging.debug("IP forward has been %s.", "enabled" if value else "disabled")
+    logging.debug("IP forward has been %s.",
+                  "enabled" if value else "disabled")
 
 
 def get_proxy_arp(ifname):
@@ -341,7 +407,7 @@ def get_proxy_arp(ifname):
     with open("/proc/sys/net/ipv4/conf/%s/proxy_arp" % ifname, "r") as f:
         value = True if int(f.read(1)) == 1 else False
     logging.debug("Proxy ARP for %s interface is %s.", ifname,
-                 "enabled" if value else "disabled")
+                  "enabled" if value else "disabled")
     return value
 
 
@@ -351,7 +417,7 @@ def set_proxy_arp(ifname, value):
     with open("/proc/sys/net/ipv4/conf/%s/proxy_arp" % ifname, "w") as f:
         f.write("1\n" if value else "0\n")
     logging.debug("Proxy ARP for %s interface has been %s.", ifname,
-                 "enabled" if value else "disabled")
+                  "enabled" if value else "disabled")
 
 
 def set_proxy_arp_for_all(value):
@@ -394,9 +460,9 @@ class RegistrationFailed(Error):
 class Extension:
     """Mobile IP Extension class."""
 
-    TYPE_MHAE = 32 # Mobile-Home Authentication Extension
-    TYPE_MFAE = 33 # Mobile-Foreign Authentication Extension
-    TYPE_FHAE = 34 # Foreign-Home Authentication Extension
+    TYPE_MHAE = 32  # Mobile-Home Authentication Extension
+    TYPE_MFAE = 33  # Mobile-Foreign Authentication Extension
+    TYPE_FHAE = 34  # Foreign-Home Authentication Extension
 
     _TYPE_DESC_TABLE = {
         32: "Mobile-Home Authentication Extension",
@@ -413,10 +479,11 @@ class Extension:
         data    -- data in the extension (optional)
         """
         if data is not None:
-            logging.debug("Length of data is %d. must be %d",len(data), length)
+            logging.debug("Length of data is %d. must be %d",
+                          len(data), length)
 
         if data is not None and len(data) != length:
-            
+
             logging.error("Length of data is invalid.")
             raise Error("Length of data is invalid.")
         self.type = type
@@ -425,8 +492,7 @@ class Extension:
 
     def __str__(self):
         return "<MobileIP Extension, Type: %d, Length: %d>" % (self.type,
-                    self.length)
-
+                                                               self.length)
 
 
 class MobileHomeAuthExtension(Extension):
@@ -452,7 +518,6 @@ class MobileHomeAuthExtension(Extension):
         return "<MobileIP Mobile-Home Auth Extension, SPI: %d>" % self.spi
 
 
-
 class Packet:
     """Mobile IP packet class."""
 
@@ -464,8 +529,7 @@ class Packet:
         3: "Registration Reply"
     }
 
-    _FORMAT = "!B" # MIP packet format: first byte defines packet Type
-
+    _FORMAT = "!B"  # MIP packet format: first byte defines packet Type
 
     def __init__(self, type, extensions=None):
         """MIP packet constructor.
@@ -478,18 +542,15 @@ class Packet:
         self.type = type
         self.extensions = [] if extensions is None else extensions
 
-
     def __str__(self):
         return "<MobileIP packet, Type: %i (%s), Extensions: %s>" % (
             self.type, Packet._TYPE_DESC_TABLE[self.type], self.extensions)
 
-
     def to_data(self):
         """Return byte array representation of the packet."""
-        
+
         logging.error("Unable to get data.")
         raise Error("Unable to get data.")
-
 
     def _calculate_mhae(self, spi, key):
         """Create and return MobileHomeAuthExtension of this packet."""
@@ -498,15 +559,16 @@ class Packet:
 
         extension = MobileHomeAuthExtension(spi)
         try:
-            packed += struct.pack("!2BI", extension.type, extension.length, spi)
+            packed += struct.pack("!2BI", extension.type,
+                                  extension.length, spi)
         except struct.error:
             logging.error("Invalid MIP Mobile-Home Auth Extension fields.")
             raise Error("Invalid MIP Mobile-Home Auth Extension fields.")
 
-        extension.authenticator = hmac.new(key, packed , hashlib.md5).digest()
+        extension.authenticator = hmac.new(
+            key.encode(), packed, hashlib.md5).digest()
 
         return extension
-
 
     def add_mhae(self, spi, key):
         """Create and add MobileHomeAuthExtension of this packet
@@ -547,7 +609,7 @@ class Packet:
 
         try:
             unpacked = struct.unpack(Packet._FORMAT,
-                data[0:struct.calcsize(Packet._FORMAT)])
+                                     data[0:struct.calcsize(Packet._FORMAT)])
         except struct.error:
             logging.error("Invalid MIP packet.")
             raise Error("Invalid MIP packet.")
@@ -581,15 +643,16 @@ class Packet:
                 try:
                     unpacked = struct.unpack("!I", data[i+2:i+2+4])
                 except struct.error:
-                    logging.error("Invalid MIP Mobile-Home Auth Extension data.")
+                    logging.error(
+                        "Invalid MIP Mobile-Home Auth Extension data.")
                     raise Error("Invalid MIP Mobile-Home Auth Extension data.")
                 spi = unpacked[0]
                 authenticator = data[i+2+4:i+2+length]
                 extensions.append(MobileHomeAuthExtension(spi,
-                    authenticator=authenticator))
+                                                          authenticator=authenticator))
             else:
                 extensions.append(Extension(type, length,
-                    data[i+2:i+2+length]))
+                                            data[i+2:i+2+length]))
 
             i += 2+length
 
@@ -599,21 +662,22 @@ class Packet:
         for extension in self.extensions:
             if isinstance(extension, MobileHomeAuthExtension):
                 try:
-                    packed += struct.pack("!2BI",extension.type,
-                        extension.length, extension.spi)
+                    packed += struct.pack("!2BI", extension.type,
+                                          extension.length, extension.spi)
                     packed += extension.authenticator[0:extension.length-4]
                 except struct.error:
-                    logging.error("Invalid MIP Mobile-Home Auth Extension fields.")
-                    raise Error("Invalid MIP Mobile-Home Auth Extension fields.")
+                    logging.error(
+                        "Invalid MIP Mobile-Home Auth Extension fields.")
+                    raise Error(
+                        "Invalid MIP Mobile-Home Auth Extension fields.")
             else:
                 try:
                     packed += struct.pack("!2B", extension.type,
-                        extension.length) + extension.data[0:extension.length]
+                                          extension.length) + extension.data[0:extension.length]
                 except struct.error:
                     logging.error("Invalid MIP Extension fields.")
                     raise Error("Invalid MIP Extension fields.")
         return packed
-
 
 
 class RegRequestPacket(Packet):
@@ -643,21 +707,22 @@ class RegRequestPacket(Packet):
 
     def _print_flags_desc(self):
         desc = ""
-        for key, value in RegRequestPacket._FLAG_DESC_TABLE.iteritems():
+        # in 2.7 for key, value in RegRequestPacket._FLAG_DESC_TABLE.iteritems():
+        for key, value in RegRequestPacket._FLAG_DESC_TABLE.items():
             desc += value if self.flags & key else ""
         return desc
 
     def __init__(
-            self,
-            flags,
-            lifetime,
-            home_address,
-            home_agent,
-            care_of_address,
-            identification = None, # part 1 timestamp row
-            identification2 = None,# part 2 timestamp row
-            extensions = None
-        ):
+        self,
+        flags,
+        lifetime,
+        home_address,
+        home_agent,
+        care_of_address,
+        identification=None,  # part 1 timestamp row
+        identification2=None,  # part 2 timestamp row
+        extensions=None
+    ):
         """MIP Registration Request constructor.
 
         Parameters:
@@ -683,13 +748,13 @@ class RegRequestPacket(Packet):
         else:
             self.identification = identification
             self.identification2 = identification2
-                    
-        self.expiration_date = 0 # timestamp when binding will expire
+
+        self.expiration_date = 0  # timestamp when binding will expire
 
     def __str__(self):
         return ("<MobileIP Reg Request, Flags: %d (%s), Lifetime: %d, " +
-        "Home address: %s, Home agent: %s, Care-of address: %s, " +
-        "Identification: %d.%d, Extensions: %s>") % (
+                "Home address: %s, Home agent: %s, Care-of address: %s, " +
+                "Identification: %d.%d, Extensions: %s>") % (
             self.flags,
             self._print_flags_desc(),
             self.lifetime,
@@ -728,16 +793,16 @@ class RegRequestPacket(Packet):
 
         extensions = Packet._extensions_from_data(
             data[struct.calcsize(RegRequestPacket._FORMAT):len(data)])
-    
+
         return RegRequestPacket(
-                unpacked[1],
-                unpacked[2],
-                int_to_ip(unpacked[3]),
-                int_to_ip(unpacked[4]),
-                int_to_ip(unpacked[5]),
-                unpacked[6],
-                unpacked[7],
-                extensions
+            unpacked[1],
+            unpacked[2],
+            int_to_ip(unpacked[3]),
+            int_to_ip(unpacked[4]),
+            int_to_ip(unpacked[5]),
+            unpacked[6],
+            unpacked[7],
+            extensions
         )
 
     def to_data(self):
@@ -745,22 +810,22 @@ class RegRequestPacket(Packet):
 
         try:
             packed = struct.pack(RegRequestPacket._FORMAT,
-                self.type,
-                self.flags,
-                self.lifetime,
-                ip_to_int(self.home_address),
-                ip_to_int(self.home_agent),
-                ip_to_int(self.care_of_address),
-                self.identification,
-                self.identification2
-            )
-            logging.debug("Registration Request to_data: %s", binascii.hexlify(packed) )
+                                 self.type,
+                                 self.flags,
+                                 self.lifetime,
+                                 ip_to_int(self.home_address),
+                                 ip_to_int(self.home_agent),
+                                 ip_to_int(self.care_of_address),
+                                 self.identification,
+                                 self.identification2
+                                 )
+            logging.debug("Registration Request to_data: %s",
+                          binascii.hexlify(packed))
 
         except struct.error:
             logging.error("Invalid Registration Request packet fields.")
             raise Error("Invalid Registration Request packet fields.")
         return self._extensions_to_data(packed)
-
 
 
 class RegReplyPacket(Packet):
@@ -806,15 +871,15 @@ class RegReplyPacket(Packet):
     _FORMAT = "!2B H 4I"
 
     def __init__(
-            self,
-            code,
-            lifetime,
-            home_address,
-            home_agent,
-            identification,
-            identification2,
-            extensions = None,
-        ):
+        self,
+        code,
+        lifetime,
+        home_address,
+        home_agent,
+        identification,
+        identification2,
+        extensions=None,
+    ):
         """MIP Registration Reply constructor.
 
         Parameters:
@@ -834,13 +899,13 @@ class RegReplyPacket(Packet):
         self.home_agent = home_agent
         self.identification = identification
         self.identification2 = identification2
-        
-        self.expiration_date = 0 # timestamp when binding will expire
+
+        self.expiration_date = 0  # timestamp when binding will expire
 
     def __str__(self):
         return ("<MobileIP Reg Reply, Code: %d (%s), Lifetime: %d, " +
-        "Home address: %s, Home agent: %s, Identification: %d,%d, " +
-        "Extensions: %s>") % (
+                "Home address: %s, Home agent: %s, Identification: %d,%d, " +
+                "Extensions: %s>") % (
             self.code,
             RegReplyPacket._CODE_DESC_TABLE[self.code],
             self.lifetime,
@@ -867,13 +932,13 @@ class RegReplyPacket(Packet):
             data[struct.calcsize(RegReplyPacket._FORMAT):len(data)])
 
         return RegReplyPacket(
-                unpacked[1],
-                unpacked[2],
-                int_to_ip(unpacked[3]),
-                int_to_ip(unpacked[4]),
-                unpacked[5],
-                unpacked[6],
-                extensions
+            unpacked[1],
+            unpacked[2],
+            int_to_ip(unpacked[3]),
+            int_to_ip(unpacked[4]),
+            unpacked[5],
+            unpacked[6],
+            extensions
         )
 
     def to_data(self):
@@ -881,19 +946,18 @@ class RegReplyPacket(Packet):
 
         try:
             packed = struct.pack(RegReplyPacket._FORMAT,
-                self.type,
-                self.code,
-                self.lifetime,
-                ip_to_int(self.home_address),
-                ip_to_int(self.home_agent),
-                self.identification,
-                self.identification2
-            )
+                                 self.type,
+                                 self.code,
+                                 self.lifetime,
+                                 ip_to_int(self.home_address),
+                                 ip_to_int(self.home_agent),
+                                 self.identification,
+                                 self.identification2
+                                 )
         except struct.error:
             logging.error("Invalid MIP Registration Reply packet fields.")
             raise Error("Invalid MIP Registration Reply packet fields.")
         return self._extensions_to_data(packed)
-
 
 
 class _BindingChecker(threading.Thread):
@@ -922,14 +986,14 @@ class _BindingChecker(threading.Thread):
             keys_to_handle = []
             self.lock.acquire()
             t = time.time()
-            for key, packet in self.binding_table.iteritems():
+            # in 2.7 for key, packet in self.binding_table.iteritems():
+            for key, packet in self.binding_table.items():
                 if 0 <= packet.expiration_date <= t:
                     keys_to_handle.append(key)
             self.lock.release()
             for key in keys_to_handle:
                 self.lifetime_expired_handler(packet)
             time.sleep(_BindingChecker._SLEEP_TIME)
-
 
 
 class _Timer(threading.Thread):
@@ -956,7 +1020,7 @@ class _Timer(threading.Thread):
         if not self.finished.is_set():
             try:
                 self.function(*self.args, **self.kwargs)
-            except Exception,e:
+            except Exception(e):
                 logging.error("Exception has been thrown in the Timer thread.")
                 logging.exception(e)
                 if self.exception_handler is not None:
@@ -978,7 +1042,7 @@ class MobileNodeAgent:
                  num_of_retr=2,
                  rereg_time=0.8,
                  wait_for_dereg_reply=True,
-        ):
+                 ):
         """Mobile Node Agent constructor.
 
         Parameters:
@@ -1006,7 +1070,7 @@ class MobileNodeAgent:
         # D flag (Decapsulation by mobile node) is mandatory.
         # Only GRE tunnel is supported, so G flag is mandatory and M is not allowed.
         # Reverse Tunneling is mandatory, so T flag is mandatory
-
+#
         if not flags & RegRequestPacket.FLAG_D:
             raise Error("D flag is not set but is mandatory.")
         if not flags & RegRequestPacket.FLAG_G:
@@ -1025,7 +1089,7 @@ class MobileNodeAgent:
         self.timeout = timeout
         self.num_of_retr = num_of_retr
         self.rereg_time = rereg_time
-        self.wait_for_dereg_reply =  wait_for_dereg_reply
+        self.wait_for_dereg_reply = wait_for_dereg_reply
         self._listening = False
         self._rereg_timer = None
         self._socket = None
@@ -1044,7 +1108,6 @@ class MobileNodeAgent:
         _del_route(home_agent+"/32")
         _create_interface("mip0", home_address)
 
-
     def __del__(self):
         """Mobile Node Agent destructor"""
 
@@ -1054,7 +1117,6 @@ class MobileNodeAgent:
             # Recreating original default routing
             _add_route(dst="default", gw=self._gateway)
             self._gateway = None
-
 
     def _update_routes(self, ifname):
         """Create or update static route to Home Agent IP address."""
@@ -1066,17 +1128,16 @@ class MobileNodeAgent:
         # Creating static route to home agent
         _add_route(self.home_agent+"/32", gw)
 
-
     def _create_tunnel(self, reg_req_packet):
         """Create GRE tunnel to Home Agent IP address."""
 
         #ifname, prefixlen = get_ifname(reg_req_packet.care_of_address)
         #gw = self._interfaces[ifname]
         #if gw is None:
-            #gw = _get_default_gw()[0]
-            #if gw is None:
+        #gw = _get_default_gw()[0]
+        #if gw is None:
         #    raise Error("Unknown gateway address.")
-            #self._gateway = gw # Saving default route gateway
+        #self._gateway = gw # Saving default route gateway
 
         # Creating static route to home agent
         #_add_route(self.home_agent+"/32", gw)
@@ -1086,7 +1147,6 @@ class MobileNodeAgent:
                        gre_local=reg_req_packet.care_of_address,
                        gre_remote=reg_req_packet.home_agent,
                        route_dst="default")
-
 
     def _destroy_tunnel(self):
         """Destroy GRE tunnel to Home Agent IP address."""
@@ -1108,7 +1168,6 @@ class MobileNodeAgent:
         # Deleting static route to home agent
         #_del_route(self.home_agent+"/32")
 
-
     def _stop_listening_stuff(self):
         # Destroying tunnel
         if self.is_registered():
@@ -1118,7 +1177,6 @@ class MobileNodeAgent:
         self._sent_reg_reqest = None
         self._is_rereg = False
         self._stop_listening()
-
 
     def _data_handler(self, data, addr):
         """Handle received data."""
@@ -1137,7 +1195,7 @@ class MobileNodeAgent:
 
         if not isinstance(in_packet, RegReplyPacket):
             logging.error("Invalid packet type has been received. " +
-                            "Discarding packet.")
+                          "Discarding packet.")
             return
 
         # Registration Reply received
@@ -1207,13 +1265,11 @@ class MobileNodeAgent:
         self._stop_listening()
         self._is_rereg = False
 
-
     def _send_packet(self, packet, addr):
         """Send given packet to given IP address."""
 
         logging.debug("Sending: %s", packet)
         self._socket.sendto(packet.to_data(), addr)
-
 
     def is_registered(self):
         """Return True if agent is registered."""
@@ -1222,13 +1278,13 @@ class MobileNodeAgent:
             return True
         return self._received_reg_reply is not None
 
-
     def get_status(self):
         """Return string containing status information."""
 
         if not self.is_registered():
             return {"registered": False}
-        ifname, prefixlen = get_ifname(address=self._sent_reg_reqest.care_of_address)
+        ifname, prefixlen = get_ifname(
+            address=self._sent_reg_reqest.care_of_address)
         if ifname is None:
             logging.error("Care-of address %s is not assigned " +
                           "to any interface.", self._sent_reg_reqest.care_of_address)
@@ -1238,8 +1294,7 @@ class MobileNodeAgent:
             "home_agent": self.home_agent,
             "care_of_address": self._sent_reg_reqest.care_of_address,
             "ifname": ifname
-            }
-
+        }
 
     def register(self, care_of_address=None, dereg_existing_reg=True,
                  lifetime=INFINITE_LIFETIME, ifname=None,
@@ -1280,22 +1335,24 @@ class MobileNodeAgent:
                 logging.error("Care-of address %s is not assigned " +
                               "to any interface.", care_of_address)
                 self._lock.release()
-                raise RegistrationFailed("Care-of address is not assigned to any interface.")
+                raise RegistrationFailed(
+                    "Care-of address is not assigned to any interface.")
         if is_address_in_subnet(self.home_address,
-                                "%s/%d"%(care_of_address, prefixlen)):
+                                "%s/%d" % (care_of_address, prefixlen)):
             logging.error("Home address (%s) belongs to " +
                           "care-of address subnet (%s/%d), so you are in " +
                           "the home network.", self.home_address,
                           care_of_address, prefixlen)
             self._lock.release()
-            raise RegistrationFailed("Home address belongs to care-of address subnet.")
+            raise RegistrationFailed(
+                "Home address belongs to care-of address subnet.")
 
         # Check if already registered
         if self.is_registered():
             if (self._sent_reg_reqest.care_of_address == care_of_address and
-                self.rereg_time is not None):
-                self._exception_handler = exception_handler # updating handler
-                logging.warning("Care-of address is already registered. "+
+                    self.rereg_time is not None):
+                self._exception_handler = exception_handler  # updating handler
+                logging.warning("Care-of address is already registered. " +
                                 "Request will not be sent.")
                 self._lock.release()
                 return
@@ -1350,7 +1407,6 @@ class MobileNodeAgent:
         self._start_listening()
         self._lock.release()
 
-
     def deregister(self, ifname=None, wait_for_reply=None):
         """Deregister Mobile Node Agent.
 
@@ -1374,7 +1430,7 @@ class MobileNodeAgent:
 
         # Resets
         self._received_reg_reply = None
-        self._num_of_retr_done = self.num_of_retr # disable retransmissions
+        self._num_of_retr_done = self.num_of_retr  # disable retransmissions
         self._rereg_timer = None
         self._closing = False
 
@@ -1382,7 +1438,7 @@ class MobileNodeAgent:
 
         # Creating Deregistration Request
         self._sent_reg_reqest.update_identification()
-        self._sent_reg_reqest.lifetime = 0 # Deregistration
+        self._sent_reg_reqest.lifetime = 0  # Deregistration
         self._sent_reg_reqest.add_mhae(self.mhae_spi, self.mhae_key)
 
         care_of_address = self._sent_reg_reqest.care_of_address
@@ -1398,7 +1454,7 @@ class MobileNodeAgent:
 
         if ifname is None or difname == ifname:
             logging.debug("Care-of address %s is assigned " +
-                         "to interface.", care_of_address)
+                          "to interface.", care_of_address)
         else:
             address, prefixlen = get_address(ifname=ifname)
             self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1414,7 +1470,7 @@ class MobileNodeAgent:
                           (self._sent_reg_reqest.home_agent, self.port))
 
         if (self.wait_for_dereg_reply if wait_for_reply is None
-            else wait_for_reply):
+                else wait_for_reply):
             # Waiting for reply
             #logging.info("Waiting for deregistration reply.")
             self._start_listening()
@@ -1424,14 +1480,13 @@ class MobileNodeAgent:
             #if self._sent_reg_reqest.flags & RegRequestPacket.FLAG_T:
             self._destroy_tunnel()
 
-
     def _handle_listening_timeout(self):
         logging.warning("Request has timeout.")
         if self.num_of_retr > self._num_of_retr_done and not self._closing:
             # Doing retransmission
-            self._num_of_retr_done += 1 # increasing counter
+            self._num_of_retr_done += 1  # increasing counter
             logging.warning("Repeating request, #%d attempt.",
-                         self._num_of_retr_done)
+                            self._num_of_retr_done)
             #self._sent_reg_reqest.update_identification()
             self._sent_reg_reqest.add_mhae(self.mhae_spi, self.mhae_key)
 
@@ -1442,7 +1497,6 @@ class MobileNodeAgent:
             logging.error("Registration Request is failed due to timeout.")
             self.cancel()
             return
-
 
     def _reregister(self):
         self._lock.acquire()
@@ -1481,25 +1535,22 @@ class MobileNodeAgent:
         self._start_listening()
         self._lock.release()
 
-
     def _start_listening(self):
         self._listening = True
 
         # Staring listening for reply
         while self._listening and not self._closing:
-            self._socket.settimeout(self.timeout) # Setting up timeout
+            self._socket.settimeout(self.timeout)  # Setting up timeout
             try:
                 data, addr = self._socket.recvfrom(1024)
             except socket.timeout:
-                self._handle_listening_timeout() # Timeout
+                self._handle_listening_timeout()  # Timeout
             else:
-                self._data_handler(data, addr) # Data received
+                self._data_handler(data, addr)  # Data received
         self._listening = False
-
 
     def _stop_listening(self):
         self._listening = False
-
 
     def cancel(self):
         """Cancel any ongoing registrations or registration attempts."""
@@ -1525,9 +1576,9 @@ class HomeAgent:
                  auth_table,
                  address="0.0.0.0",
                  port=434,
-                 max_lifetime=INFINITE_LIFETIME, # Maximum acceptable Lifetime for registration
-                 max_ident_mismatch=7, # Accepted timestamp mismatch in sec for identification
-                 ip_pool="172.16.0.0/24"):
+                 max_lifetime=INFINITE_LIFETIME,  # Maximum acceptable Lifetime for registration
+                 max_ident_mismatch=7,  # Accepted timestamp mismatch in sec for identification
+                 ip_pool="172.16.0.0/16"):
         """Home Agent constructor.
 
         Parameters:
@@ -1556,39 +1607,38 @@ class HomeAgent:
         self.max_ident_mismatch = max_ident_mismatch
         self._ip_pool = IPNetwork(ip_pool)
         self._socket = None
+        self._last_id = 0
         self._binding_table = {}
+        self._binding_table_ids = {}
         self._binding_table_lock = threading.Lock()
         self._binding_checker = _BindingChecker(
             lock=self._binding_table_lock,
             binding_table=self._binding_table,
             lifetime_expired_handler=self._lifetime_expired_handler)
 
-
-    def __del__():
+    def __del__(self):
         """Home Agent destructor"""
 
-        _destroy_interfaces("mip") # Destroying all mipX interfaces
-        set_ip_forward(False) # Disabling kernel IP forwarding
-        set_proxy_arp_for_all(False) # Disabling Proxy ARP
-
+        _destroy_interfaces("mip")  # Destroying all mipX interfaces
+        set_ip_forward(False)  # Disabling kernel IP forwarding
+        set_proxy_arp_for_all(False)  # Disabling Proxy ARP
 
     def _lifetime_expired_handler(self, reg_req_packet):
         """Handle registration expiration"""
 
         logging.warning("Binding [home address=%s, CoA=%s] has expired.",
-                     reg_req_packet.home_address,
-                     reg_req_packet.care_of_address)
+                        reg_req_packet.home_address,
+                        reg_req_packet.care_of_address)
         self._destroy_binding(reg_req_packet)
-
 
     def _print_binding_table(self):
         """Return registration binding table description."""
 
         desc = "{"
-        for key, value in self._binding_table.iteritems():
+        # in 2.7 for key, value in self._binding_table.iteritems():
+        for key, value in self._binding_table.items():
             desc += "[home address=%s, CoA=%s]" % (key, value.care_of_address)
         return desc + "}"
-
 
     def _get_binding(self, home_address):
         """Return RegRequestPacket used in the registration for
@@ -1598,22 +1648,24 @@ class HomeAgent:
             return self._binding_table[home_address]
         return None
 
-
     def _destroy_binding(self, reg_req_packet):
         """Destroy registration binding for given RegRequestPacket."""
 
         if reg_req_packet.home_address in self._binding_table:
-            self._destroy_tunnel(reg_req_packet)
+            if reg_req_packet.flags & reg_req_packet.FLAG_T:
+                self._destroy_route(reg_req_packet)
+            else:        
+                self._destroy_tunnel(reg_req_packet)
             self._binding_table_lock.acquire()
             logging.debug("Destroing [home address=%s, CoA=%s] binding.",
-                         reg_req_packet.home_address,
-                         reg_req_packet.care_of_address)
+                          reg_req_packet.home_address,
+                          reg_req_packet.care_of_address)
             del self._binding_table[reg_req_packet.home_address]
+            del self._binding_table_ids[reg_req_packet.home_address]
             self._binding_table_lock.release()
         else:
             logging.warning("Unable to find binding for home address=%s.",
-                            home_address)
-
+                            reg_req_packet.home_address)
 
     def _create_binding(self, reg_req_packet):
         """Create registration binding for given RegRequestPacket."""
@@ -1623,13 +1675,14 @@ class HomeAgent:
                            else time.time() + reg_req_packet.lifetime)
 
         # Handling existing binding
-        existing_reg_req_packet = self._get_binding(reg_req_packet.home_address)
+        existing_reg_req_packet = self._get_binding(
+            reg_req_packet.home_address)
         if existing_reg_req_packet is not None:
             if existing_reg_req_packet.is_update_request(reg_req_packet):
                 # reg_req_packet is an update, so updating only expiration_date
                 logging.debug("Updating [home address=%s, CoA=%s] binding.",
-                             existing_reg_req_packet.home_address,
-                             existing_reg_req_packet.care_of_address)
+                              existing_reg_req_packet.home_address,
+                              existing_reg_req_packet.care_of_address)
                 existing_reg_req_packet.expiration_date = expiration_date
                 return
             # reg_req_packet is not an update, so destroying existing binding
@@ -1638,46 +1691,63 @@ class HomeAgent:
         # Creating new binding
         self._binding_table_lock.acquire()
         logging.debug("Creating new binding [home address=%s, CoA=%s].",
-                     reg_req_packet.home_address,
-                     reg_req_packet.care_of_address)
+                      reg_req_packet.home_address,
+                      reg_req_packet.care_of_address)
         reg_req_packet.expiration_date = expiration_date
         self._binding_table[reg_req_packet.home_address] = reg_req_packet
+        self._binding_table_ids[reg_req_packet.home_address] = self._last_id
+        self._last_id += 1
         self._binding_table_lock.release()
 
         # Create tunnel
-        self._create_tunnel(reg_req_packet)
-
+        if (reg_req_packet.flags & reg_req_packet.FLAG_T) and not (reg_req_packet.flags & reg_req_packet.FLAG_G):
+                self._create_tunnel(reg_req_packet, "ipip")
+        else:
+                self._create_tunnel(reg_req_packet)
 
     def _get_binding_id(self, home_address):
         """Return id of registration binding for given Home Address."""
+        print(home_address)
+        print(self._binding_table_ids[home_address])
+        # self._binding_table.keys().index(home_address)
+        return self._binding_table_ids[home_address]
 
-        return self._binding_table.keys().index(home_address)
+    def _create_tunnel(self, reg_req_packet, tun_type="gre"):
+        """Create typed tunnel for given RegRequestPacket."""
+        if tun_type == "gre":
+                tid = self._get_binding_id(reg_req_packet.home_address)
+                _create_tunnel(name="mip"+str(tid),
+                               ip=str(self._ip_pool[tid+1]),
+                               gre_local=reg_req_packet.care_of_address,  # self.address,
+                               gre_remote=reg_req_packet.home_address,  # reg_req_packet.care_of_address,
+                               route_dst=reg_req_packet.home_address+"/32")
+        elif tun_type == "ipip":
+                _create_ipip_tunnel(reg_req_packet.home_agent,
+                                    reg_req_packet.care_of_address,
+                                    "mip",
+                                    reg_req_packet.home_address
+                                    )
+        else:
+                logging.debug("incompatible tunnel type: %s", tun_type)
+                RegRequestPacket
 
-
-    def _create_tunnel(self, reg_req_packet):
-        """Create GRE tunnel for given RegRequestPacket."""
-
-        tid = self._get_binding_id(reg_req_packet.home_address)
-        _create_tunnel(name="mip"+str(tid),
-                       ip=str(self._ip_pool[tid+1]),
-                       gre_local=self.address,
-                       gre_remote=reg_req_packet.care_of_address,
-                       route_dst=reg_req_packet.home_address+"/32")
-
+    def _destroy_route(self, reg_req_packet):
+            """ remove route for unit"""
+            os.system("ip route del %s" % reg_req_packet.home_address)
+            return 0
 
     def _destroy_tunnel(self, reg_req_packet):
         """Destroy GRE tunnel for given RegRequestPacket."""
-
-        tid = self._get_binding_id(reg_req_packet.home_address)
+#TODO might be overflow if many records processed
+        # self._get_binding_id(reg_req_packet.home_address)
+        tid = self._binding_table_ids[reg_req_packet.home_address]
         _destroy_interface(name="mip"+str(tid))
-
 
     def _send_packet(self, packet, addr):
         """Send packet to given address."""
 
         logging.info("Sending: %s", packet)
         self._socket.sendto(packet.to_data(), addr)
-
 
     def _check_flags(self, flags):
         """Return True, if given flags are supported."""
@@ -1689,6 +1759,9 @@ class HomeAgent:
         # not supported.
         # Only GRE tunnel is supported, so G is mandatory and M is not allowed.
         is_ok = True
+# TODO
+        if flags & RegRequestPacket.FLAG_T:
+            return is_ok
 
         if not flags & RegRequestPacket.FLAG_D:
             logging.warning("D flag is not set but is mandatory.")
@@ -1707,7 +1780,6 @@ class HomeAgent:
             is_ok = False
         return is_ok
 
-
     def _data_handler(self, data, addr):
         """Handle received data."""
 
@@ -1721,12 +1793,12 @@ class HomeAgent:
 
         if not isinstance(in_packet, RegRequestPacket):
             logging.warning("Invalid packet type has been received. " +
-                           "Discarding packet.")
+                            "Discarding packet.")
             return
 
         # Registration Request received
         logging.info("Registration Request has been received.")
-        logging.debug("Bindings table: %s" , self._print_binding_table())
+        logging.debug("Bindings table: %s", self._print_binding_table())
 
         # MHAE verification
         mhae = in_packet.get_mhae()
@@ -1748,7 +1820,7 @@ class HomeAgent:
                 in_packet.home_agent,
                 in_packet.identification,
                 in_packet.identification2
-                )
+            )
             out_packet.add_mhae(mhae.spi, key)
             self._send_packet(out_packet, addr)
             return
@@ -1757,7 +1829,7 @@ class HomeAgent:
         existing_reg_req_packet = self._get_binding(in_packet.home_address)
         if existing_reg_req_packet is not None:
             if (existing_reg_req_packet.identification == in_packet.identification
-                and existing_reg_req_packet.care_of_address == in_packet.care_of_address):
+                    and existing_reg_req_packet.care_of_address == in_packet.care_of_address):
                 logging.warning("Request is a retransmission. " +
                                 "Discarding request.")
                 return
@@ -1775,7 +1847,7 @@ class HomeAgent:
                 in_packet.home_agent,
                 in_packet.identification,
                 in_packet.identification2
-                )
+            )
             out_packet.add_mhae(mhae.spi, key)
             self._send_packet(out_packet, addr)
             return
@@ -1830,7 +1902,6 @@ class HomeAgent:
         out_packet.add_mhae(mhae.spi, key)
         self._send_packet(out_packet, addr)
 
-
     def start(self):
         """Start Home Agent server."""
 
@@ -1841,15 +1912,14 @@ class HomeAgent:
         self._socket.bind((self.address, self.port))
         self._binding_checker.start()
 
-        _destroy_interfaces("mip") # Destroying all mipX interfaces
-        set_proxy_arp_for_all(True) # Enabling Proxy ARP
-        set_ip_forward(True) # Enabling kernel IP forwarding
+        _destroy_interfaces("mip")  # Destroying all mipX interfaces
+        set_proxy_arp_for_all(True)  # Enabling Proxy ARP
+        set_ip_forward(True)  # Enabling kernel IP forwarding
 
         logging.info("Home Agent is started.")
         while self._socket is not None:
             data, addr = self._socket.recvfrom(1024)
             self._data_handler(data, addr)
-
 
     def stop(self):
         """Stop Home Agent server."""
@@ -1857,9 +1927,9 @@ class HomeAgent:
         self._stopping = True
         self._binding_checker.stop()
 
-        _destroy_interfaces("mip") # Destroying all mipX interfaces
-        set_ip_forward(False) # Disabling kernel IP forwarding
-        set_proxy_arp_for_all(False) # Disabling Proxy ARP
+        _destroy_interfaces("mip")  # Destroying all mipX interfaces
+        set_ip_forward(False)  # Disabling kernel IP forwarding
+        set_proxy_arp_for_all(False)  # Disabling Proxy ARP
 
         if self._socket is not None:
             self._socket.close()
