@@ -1,6 +1,6 @@
 # Mobile IP implementation for Linux
 
-Partial implementation of [RFC 5944](https://tools.ietf.org/html/rfc5944) Mobile IP framework for Linux, written in Python 2.7.
+Partial implementation of [RFC 5944](https://tools.ietf.org/html/rfc5944) Mobile IP framework for Linux, written in Python 3.6.
 
 ## Overview
 
@@ -16,6 +16,7 @@ Following key features are supported:
 * Co-loacated care-of address mode
 * Forward and Reverse tunneling
 * GRE encapsulation
+* IPIP encapsulation Reverse tunneling
 * Indentification based on timestamp
 
 Following key features are not supported:
